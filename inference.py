@@ -117,7 +117,7 @@ def run_task(task_name: str):
     step = 0
 
     while not done:
-        obs_dict = obs.dict()
+        obs_dict = obs.model_dump()
         action_dict = get_action_from_llm(obs_dict, conversation_history)
 
         action = IncidentAction(
