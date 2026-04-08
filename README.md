@@ -1,3 +1,17 @@
+python -c "
+content = '''---
+title: Incident Commander Env
+emoji: 🚨
+colorFrom: red
+colorTo: orange
+sdk: docker
+pinned: false
+tags:
+
+- openenv
+
+---
+
 # Incident Commander Environment 🚨
 
 An OpenEnv RL environment simulating real-world SRE production incident response.
@@ -41,24 +55,18 @@ current_step, max_steps, resolved
 
 ## Setup
 
-```bash
 pip install -r requirements.txt
 python app.py
-```
 
 ## Docker
 
-```bash
 docker build -t incident-commander-env .
 docker run -p 7860:7860 incident-commander-env
-```
 
 ## Inference
 
-```bash
 export HF_TOKEN=your_token
 python inference.py
-```
 
 ## Baseline Scores
 
@@ -67,3 +75,8 @@ python inference.py
 | easy   | 0.80  |
 | medium | 0.65  |
 | hard   | 0.45  |
+
+'''
+open('README.md','w').write(content)
+print('README.md fixed')
+"

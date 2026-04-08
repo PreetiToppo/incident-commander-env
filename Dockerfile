@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+python -c "
+content = '''FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -9,4 +10,8 @@ COPY . .
 
 EXPOSE 7860
 
-CMD ["python", "app.py"]
+CMD [\"uvicorn\", \"app:app\", \"--host\", \"0.0.0.0\", \"--port\", \"7860\"]
+'''
+open('Dockerfile','w').write(content)
+print('Dockerfile fixed')
+"
