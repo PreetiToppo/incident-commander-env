@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from typing import Optional, Dict, Any
 from pydantic import BaseModel
@@ -11,13 +11,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# In-memory session store
 sessions: Dict[str, IncidentCommanderEnv] = {}
-
-
-class ResetRequest(BaseModel):
-    task: Optional[str] = "easy"
-    session_id: Optional[str] = "default"
 
 
 class StepRequest(BaseModel):
@@ -42,10 +36,19 @@ def health():
 
 
 @app.post("/reset")
-def reset(request: ResetRequest):
-    env = IncidentCommanderEnv(task=request.task)
+async def reset(request: Request):
+    # Accept empty body OR json body
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    task = body.get("task", "easy") if body else "easy"
+    session_id = body.get("session_id", "default") if body else "default"
+
+    env = IncidentCommanderEnv(task=task)
     obs = env.reset()
-    sessions[request.session_id] = env
+    sessions[session_id] = env
     return obs.dict()
 
 
@@ -53,8 +56,15 @@ def reset(request: ResetRequest):
 def step(request: StepRequest):
     env = sessions.get(request.session_id)
     if env is None:
-        raise HTTPException(status_code=404, detail="Session not found. Call /reset first.")
-    action = IncidentAction(action_type=request.action_type, parameters=request.parameters)
+        # Auto-create session if missing
+        env = IncidentCommanderEnv(task="easy")
+        env.reset()
+        sessions[request.session_id] = env
+
+    action = IncidentAction(
+        action_type=request.action_type,
+        parameters=request.parameters
+    )
     obs, reward, done, info = env.step(action)
     return {
         "observation": obs.dict(),
@@ -68,15 +78,22 @@ def step(request: StepRequest):
 def state(session_id: str = "default"):
     env = sessions.get(session_id)
     if env is None:
-        raise HTTPException(status_code=404, detail="Session not found.")
+        env = IncidentCommanderEnv(task="easy")
+        obs = env.reset()
+        sessions[session_id] = env
     return env.state()
 
 
 @app.post("/grade")
-def grade(session_id: str = "default"):
+async def grade(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    session_id = body.get("session_id", "default") if body else "default"
     env = sessions.get(session_id)
     if env is None:
-        raise HTTPException(status_code=404, detail="Session not found.")
+        return {"score": 0.0}
     return {"score": env.grade()}
 
 
@@ -84,9 +101,9 @@ def grade(session_id: str = "default"):
 def list_tasks():
     return {
         "tasks": [
-            {"name": "easy", "description": "Payment Service High Latency — DB connection pool exhaustion", "difficulty": 1},
-            {"name": "medium", "description": "Cascading Failures in Recommendation Engine — memory leak", "difficulty": 2},
-            {"name": "hard", "description": "Silent Data Corruption in Order Pipeline — Kafka duplicate processing", "difficulty": 3}
+            {"name": "easy", "description": "Payment Service High Latency", "difficulty": 1},
+            {"name": "medium", "description": "Cascading Failures in Recommendation Engine", "difficulty": 2},
+            {"name": "hard", "description": "Silent Data Corruption in Order Pipeline", "difficulty": 3}
         ]
     }
 
