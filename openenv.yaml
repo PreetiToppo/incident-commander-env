@@ -1,0 +1,55 @@
+name: incident-commander-env
+version: "1.0.0"
+description: >
+  An OpenEnv RL environment simulating real-world SRE production incident response.
+  Agents must triage, diagnose, and resolve production incidents using systematic
+  investigation — checking logs, metrics, traces, and applying correct fixes.
+author: Preeti Toppo
+tags:
+  - openenv
+  - sre
+  - incident-response
+  - real-world
+  - agentic
+tasks:
+  - name: easy
+    description: "Payment Service High Latency — DB connection pool exhaustion"
+    difficulty: easy
+    max_steps: 8
+  - name: medium
+    description: "Cascading Failures in Recommendation Engine — memory leak"
+    difficulty: medium
+    max_steps: 12
+  - name: hard
+    description: "Silent Data Corruption in Order Pipeline — Kafka duplicate processing"
+    difficulty: hard
+    max_steps: 16
+observation_space:
+  type: object
+  fields:
+    incident_id: string
+    title: string
+    severity: string
+    affected_services: list[string]
+    alert_messages: list[string]
+    logs: list[string]
+    metrics: dict
+    available_actions: list[string]
+    current_step: int
+    max_steps: int
+    resolved: bool
+action_space:
+  type: object
+  fields:
+    action_type: string
+    parameters: dict
+reward:
+  range: [-1.0, 1.0]
+  description: >
+    Rewards positive investigation steps (+0.15), correct root cause (+0.25),
+    correct fix (+0.20), resolution (+0.30). Penalizes repeated actions (-0.05),
+    wrong root cause (-0.10), premature resolution (-0.15).
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
