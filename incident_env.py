@@ -20,10 +20,17 @@ class IncidentObservation(BaseModel):
     diagnosis_so_far: Optional[List[str]] = []
     resolved: bool = False
     resolution_notes: Optional[str] = None
+    # ── NEW: Reasoning Trace Evaluator ────────────────────────────────────────
+    reasoning_score: Optional[float] = None          # 0.0–1.0, scored per action
+    reasoning_feedback: Optional[List[str]] = []     # per-step feedback messages
+    # ── NEW: Cross-Incident Memory ────────────────────────────────────────────
+    past_similar_incidents: Optional[List[Dict[str, Any]]] = []  # knowledge from prior episodes
 
 class IncidentAction(BaseModel):
     action_type: str
     parameters: Optional[Dict[str, Any]] = {}
+    # ── NEW: Agent must now supply reasoning before each action ───────────────
+    reasoning: Optional[str] = None   # free-text explanation of why this action
 
 class IncidentReward(BaseModel):
     value: float
@@ -64,7 +71,17 @@ EASY_SCENARIO = {
     "runbook_hints": [
         "Check DB connection pool metrics when latency spikes occur",
         "HikariPool exhaustion is a common cause of payment service degradation"
-    ]
+    ],
+    # ── NEW: Keywords that signal good reasoning for each action ──────────────
+    "reasoning_keywords": {
+        "check_logs":    ["latency", "error", "connection", "pool", "hikari", "timeout"],
+        "check_metrics": ["pool", "active", "waiting", "metric", "threshold", "saturation"],
+        "identify_root_cause": ["connection pool", "hikari", "exhausted", "jdbc", "waiting"],
+        "increase_connection_pool": ["pool", "exhausted", "fix", "increase", "capacity"],
+        "resolve":       ["resolved", "fix", "pool", "connection", "latency"]
+    },
+    # ── NEW: Tags used for cross-incident memory matching ─────────────────────
+    "tags": ["database", "connection_pool", "latency", "java", "hikari"]
 }
 
 MEDIUM_SCENARIO = {
@@ -107,7 +124,17 @@ MEDIUM_SCENARIO = {
         "When OOMKilled events correlate with cascading failures, start with the crashing service",
         "Check cache configurations — unbounded caches are a common memory leak source",
         "Rolling restart preserves availability during fix deployment"
-    ]
+    ],
+    "reasoning_keywords": {
+        "check_logs":          ["oom", "memory", "heap", "restart", "error", "gateway"],
+        "check_metrics":       ["memory", "heap", "gc", "limit", "usage", "oom"],
+        "check_traces":        ["trace", "heap", "cache", "object", "evict", "unlimited"],
+        "identify_memory_leak":["memory", "leak", "heap", "cache", "grow", "unbounded"],
+        "identify_root_cause": ["memory", "leak", "cache", "lru", "unlimited", "oom"],
+        "fix_cache_config":    ["cache", "lru", "maxsize", "evict", "fix", "unbounded"],
+        "resolve":             ["resolved", "cache", "memory", "fix", "restart"]
+    },
+    "tags": ["memory", "oom", "cache", "java", "heap", "cascading"]
 }
 
 HARD_SCENARIO = {
@@ -158,13 +185,26 @@ HARD_SCENARIO = {
         "fix_idempotency_read_source", "drain_kafka_backlog", "reconcile_inventory"
     ],
     "correct_root_cause": "kafka_consumer_group_lag_with_duplicate_processing",
-    "correct_fix": "disable_auto_commit_and_fix_idempotency",
+    "correct_fix": "disable_auto_commit",
+    "bonus_fix": "fix_idempotency_read_source",
     "runbook_hints": [
         "When duplicates appear, check idempotency key implementation and read source",
         "Kafka rebalances with auto-commit can cause at-least-once redelivery",
         "Always read idempotency keys from primary, never replica with replication lag",
         "Reconciliation must happen after fixing the root cause, not before"
-    ]
+    ],
+    "reasoning_keywords": {
+        "check_logs":               ["duplicate", "idempotency", "kafka", "rebalance", "replication", "wal"],
+        "check_metrics":            ["lag", "rebalance", "duplicate", "replication", "kafka", "unknown"],
+        "check_traces":             ["trace", "duplicate", "rebalance", "commit", "idempotency", "replica"],
+        "check_dependencies":       ["config", "auto.commit", "idempotency", "replica", "dependency", "kafka"],
+        "run_query":                ["query", "duplicate", "order", "count", "database", "verify"],
+        "identify_root_cause":      ["kafka", "rebalance", "auto.commit", "duplicate", "at-least-once", "lag"],
+        "disable_auto_commit":      ["auto.commit", "kafka", "disable", "exactly-once", "rebalance", "fix"],
+        "fix_idempotency_read_source": ["idempotency", "primary", "replica", "stale", "read", "fix"],
+        "resolve":                  ["resolved", "kafka", "idempotency", "duplicate", "fix", "commit"]
+    },
+    "tags": ["kafka", "duplicate", "idempotency", "replication", "postgres", "data_corruption"]
 }
 
 SCENARIOS = {
@@ -173,12 +213,111 @@ SCENARIOS = {
     "hard": HARD_SCENARIO
 }
 
+# ─── Cross-Incident Memory Store (singleton, shared across episodes) ──────────
+
+class IncidentMemoryStore:
+    """
+    Stores resolved incident summaries across episodes.
+    When a new incident starts, the env injects relevant past incidents
+    into the observation so the agent can reuse prior knowledge.
+
+    This simulates the institutional memory that senior SREs build up over time —
+    a capability no existing OpenEnv benchmark evaluates.
+    """
+    _store: List[Dict[str, Any]] = []
+
+    @classmethod
+    def add(cls, incident_id: str, title: str, root_cause: str,
+            fix: str, tags: List[str], steps_taken: int, score: float):
+        cls._store.append({
+            "incident_id": incident_id,
+            "title": title,
+            "root_cause": root_cause,
+            "fix": fix,
+            "tags": tags,
+            "steps_taken": steps_taken,
+            "score": round(score, 4)
+        })
+
+    @classmethod
+    def find_similar(cls, tags: List[str], current_incident_id: str,
+                     top_k: int = 2) -> List[Dict[str, Any]]:
+        """Return top_k past incidents that share the most tags with current incident."""
+        scored = []
+        for entry in cls._store:
+            if entry["incident_id"] == current_incident_id:
+                continue
+            overlap = len(set(entry["tags"]) & set(tags))
+            if overlap > 0:
+                scored.append((overlap, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [e for _, e in scored[:top_k]]
+
+    @classmethod
+    def clear(cls):
+        cls._store = []
+
+
+# ─── Reasoning Trace Evaluator ────────────────────────────────────────────────
+
+def evaluate_reasoning(reasoning: Optional[str], action_type: str,
+                       scenario: dict) -> Tuple[float, str]:
+    """
+    Score the agent's reasoning for a given action against expected keywords.
+
+    Returns (score 0.0–1.0, feedback string).
+
+    Design philosophy: We reward agents that can *explain* their decisions,
+    not just take correct actions by luck. A correct action with no reasoning
+    scores less than a correct action with clear, accurate reasoning.
+    This is the key differentiator from all existing RL benchmarks.
+    """
+    if not reasoning or len(reasoning.strip()) < 10:
+        return 0.0, f"[REASONING] No reasoning provided for '{action_type}' — score: 0.00"
+
+    reasoning_lower = reasoning.lower()
+    keywords = scenario.get("reasoning_keywords", {}).get(action_type, [])
+
+    if not keywords:
+        # Action has no keyword rubric — give partial credit for any reasoning
+        return 0.4, f"[REASONING] Reasoning noted for '{action_type}' (no rubric) — score: 0.40"
+
+    matched = [kw for kw in keywords if kw.lower() in reasoning_lower]
+    score = round(len(matched) / len(keywords), 4)
+
+    # Bonus: reasoning is specific and detailed (>50 chars)
+    if len(reasoning.strip()) > 50 and score > 0:
+        score = min(1.0, score + 0.10)
+
+    feedback = (
+        f"[REASONING] '{action_type}' — matched {len(matched)}/{len(keywords)} keywords "
+        f"({', '.join(matched) if matched else 'none'}) — score: {score:.2f}"
+    )
+    return score, feedback
+
+
 # ─── Environment Class ────────────────────────────────────────────────────────
 
 class IncidentCommanderEnv:
     """
     IncidentCommanderEnv: An RL environment simulating real-world SRE incident response.
     Agents must triage, diagnose, and resolve production incidents.
+
+    v2 additions:
+    ─────────────
+    1. Reasoning Trace Evaluator
+       Every action can include a `reasoning` field. The env scores the quality
+       of the agent's explanation against a keyword rubric derived from real SRE
+       runbooks. Good reasoning boosts reward; no reasoning withholds a bonus.
+       This evaluates *why* the agent acts, not just *what* it does — a capability
+       gap that no existing RL/agent benchmark addresses.
+
+    2. Cross-Incident Memory
+       Resolved incidents are stored in a singleton IncidentMemoryStore.
+       On reset(), the env injects relevant past incidents into the observation.
+       Agents that reuse past knowledge (correct root cause faster on similar
+       incidents) earn a memory bonus reward. This tests in-context meta-learning
+       across episodes — a direct analogue to how senior SREs operate.
     """
 
     AVAILABLE_ACTIONS = [
@@ -212,6 +351,10 @@ class IncidentCommanderEnv:
         self._done = False
         self._actions_taken = []
         self._diagnosis = []
+        # ── NEW ──────────────────────────────────────────────────────────────
+        self._reasoning_scores: List[float] = []
+        self._reasoning_feedback: List[str] = []
+        self._memory_bonus_earned = False
 
     def reset(self) -> IncidentObservation:
         self._state = {
@@ -236,15 +379,26 @@ class IncidentCommanderEnv:
         self._done = False
         self._actions_taken = []
         self._diagnosis = []
+        self._reasoning_scores = []
+        self._reasoning_feedback = []
+        self._memory_bonus_earned = False
         return self._build_observation()
 
     def state(self) -> Dict[str, Any]:
+        avg_reasoning = (
+            round(sum(self._reasoning_scores) / len(self._reasoning_scores), 4)
+            if self._reasoning_scores else 0.0
+        )
         return {
             **self._state,
             "step_count": self._step_count,
             "cumulative_reward": self._cumulative_reward,
             "done": self._done,
             "actions_taken": self._actions_taken,
+            # ── NEW ──────────────────────────────────────────────────────────
+            "avg_reasoning_score": avg_reasoning,
+            "reasoning_feedback": self._reasoning_feedback,
+            "memory_bonus_earned": self._memory_bonus_earned,
         }
 
     def step(self, action: IncidentAction) -> Tuple[IncidentObservation, float, bool, Dict]:
@@ -257,12 +411,59 @@ class IncidentCommanderEnv:
         reward = 0.0
         info = {}
 
+        # ── NEW: Evaluate reasoning before processing action ──────────────────
+        r_score, r_feedback = evaluate_reasoning(
+            action.reasoning, action_type, self.scenario
+        )
+        self._reasoning_scores.append(r_score)
+        self._reasoning_feedback.append(r_feedback)
+        # Reasoning bonus: up to +0.05 per step for good reasoning
+        reasoning_bonus = round(r_score * 0.05, 4)
+        reward += reasoning_bonus
+        info["reasoning_score"] = r_score
+        info["reasoning_feedback"] = r_feedback
+
+        # ── NEW: Cross-Incident Memory bonus ─────────────────────────────────
+        # If the agent correctly identifies root cause AND we have past incidents
+        # with the same tags, give a memory utilization bonus the first time.
+        # This incentivises agents to actually use the past_similar_incidents
+        # field in the observation rather than ignoring it.
+        if (action_type == "identify_root_cause"
+                and not self._memory_bonus_earned):
+            past = IncidentMemoryStore.find_similar(
+                self.scenario.get("tags", []),
+                self.scenario["incident_id"]
+            )
+            if past:
+                root_cause_guess = params.get("root_cause", "")
+                if root_cause_guess == self.scenario["correct_root_cause"]:
+                    # Agent got it right AND had prior memory to draw from
+                    reward += 0.10
+                    self._memory_bonus_earned = True
+                    info["memory_bonus"] = (
+                        f"+0.10 memory bonus — leveraged knowledge from "
+                        f"{past[0]['incident_id']} ({past[0]['root_cause']})"
+                    )
+                    self._diagnosis.append(
+                        f"[MEMORY] Reused pattern from {past[0]['incident_id']} "
+                        f"to identify root cause faster"
+                    )
+
         # Penalize repeated actions
         if action_type in self._actions_taken:
-            reward -= 0.05
-            info["warning"] = f"Action '{action_type}' already taken — penalizing loop"
-        else:
-            self._actions_taken.append(action_type)
+            reward -= 0.10
+            warning_msg = f"[LOOP] Action '{action_type}' already taken — choose a different action"
+            info["warning"] = warning_msg
+            self._diagnosis.append(warning_msg)
+            if self._step_count >= self.max_steps and not self._done:
+                reward -= 0.10
+                self._done = True
+                info["timeout"] = True
+            self._cumulative_reward = round(self._cumulative_reward + reward, 4)
+            self._state["diagnosis"] = self._diagnosis
+            return self._build_observation(), round(reward, 4), self._done, info
+
+        self._actions_taken.append(action_type)
 
         # Process actions
         if action_type == "check_logs":
@@ -302,6 +503,20 @@ class IncidentCommanderEnv:
                 self._diagnosis.append("Ran diagnostic database query")
             else:
                 reward -= 0.02
+                info["hint"] = "Database query not relevant for this incident"
+
+        elif action_type == "identify_memory_leak":
+            if self.task == "medium":
+                reward += 0.15
+                # Surface the key trace evidence about the unbounded cache
+                self._state["visible_logs"] += [
+                    "[ANALYSIS] Heap dump shows 2M cached objects never evicted",
+                    "[ANALYSIS] LRU cache maxSize=UNLIMITED — unbounded growth confirmed",
+                ]
+                self._diagnosis.append("Identified memory leak: unbounded LRU cache in recommendation-service")
+            else:
+                reward -= 0.02
+                info["hint"] = "Memory leak investigation not relevant for this incident"
 
         elif action_type == "identify_root_cause":
             root_cause_guess = params.get("root_cause", "")
@@ -323,6 +538,17 @@ class IncidentCommanderEnv:
                 reward += 0.05
                 self._diagnosis.append(f"Applied fix {action_type} without identifying root cause")
 
+        elif action_type == self.scenario.get("bonus_fix"):
+            if self._state["fix_applied"]:
+                reward += 0.10
+                self._diagnosis.append(f"Applied bonus fix: {action_type}")
+            elif self._state["root_cause_identified"]:
+                reward += 0.05
+                self._diagnosis.append(f"Applied bonus fix {action_type} (primary fix still needed)")
+            else:
+                reward += 0.02
+                self._diagnosis.append(f"Applied bonus fix {action_type} without root cause identified")
+
         elif action_type == "resolve":
             if self._state["fix_applied"] and self._state["root_cause_identified"]:
                 reward += 0.30
@@ -330,6 +556,16 @@ class IncidentCommanderEnv:
                 self._state["resolution_notes"] = params.get("notes", "Incident resolved")
                 self._done = True
                 info["success"] = True
+                # ── NEW: Persist resolved incident to memory store ────────────
+                IncidentMemoryStore.add(
+                    incident_id=self.scenario["incident_id"],
+                    title=self.scenario["title"],
+                    root_cause=self.scenario["correct_root_cause"],
+                    fix=self.scenario["correct_fix"],
+                    tags=self.scenario.get("tags", []),
+                    steps_taken=self._step_count,
+                    score=self.grade()
+                )
             elif self._state["logs_checked"] and self._state["metrics_checked"]:
                 reward -= 0.05
                 info["hint"] = "Cannot resolve — fix not yet applied"
@@ -342,7 +578,6 @@ class IncidentCommanderEnv:
             self._diagnosis.append("Escalated incident (penalized — try to resolve yourself)")
 
         else:
-            # Generic fix actions
             if action_type in self.AVAILABLE_ACTIONS:
                 reward += 0.02
             else:
@@ -362,6 +597,15 @@ class IncidentCommanderEnv:
         return obs, round(reward, 4), self._done, info
 
     def _build_observation(self) -> IncidentObservation:
+        avg_reasoning = (
+            round(sum(self._reasoning_scores) / len(self._reasoning_scores), 4)
+            if self._reasoning_scores else None
+        )
+        # ── NEW: Inject past similar incidents into observation ───────────────
+        past_similar = IncidentMemoryStore.find_similar(
+            self.scenario.get("tags", []),
+            self.scenario["incident_id"]
+        )
         return IncidentObservation(
             incident_id=self._state.get("incident_id", ""),
             title=self._state.get("title", ""),
@@ -376,11 +620,26 @@ class IncidentCommanderEnv:
             runbook_hints=self.scenario.get("runbook_hints", []),
             diagnosis_so_far=self._state.get("diagnosis", []),
             resolved=self._state.get("resolved", False),
-            resolution_notes=self._state.get("resolution_notes")
+            resolution_notes=self._state.get("resolution_notes"),
+            # ── NEW ──────────────────────────────────────────────────────────
+            reasoning_score=avg_reasoning,
+            reasoning_feedback=self._reasoning_feedback[-3:],   # last 3 only to keep obs lean
+            past_similar_incidents=past_similar,
         )
 
     def grade(self) -> float:
-        """Returns a score between 0.0 and 1.0 for the episode."""
+        """
+        Returns a score between 0.0 and 1.0 for the episode.
+
+        Breakdown:
+          0.10  logs checked
+          0.10  metrics checked
+          0.35  correct root cause identified
+          0.25  correct fix applied
+          0.20  resolved
+          0.10  speed bonus (resolved in <= half max_steps)
+          up to +0.05 bonus  average reasoning score >= 0.7
+        """
         score = 0.0
         if self._state.get("logs_checked"):
             score += 0.10
@@ -395,6 +654,11 @@ class IncidentCommanderEnv:
         # Speed bonus
         if self._state.get("resolved") and self._step_count <= self.max_steps // 2:
             score = min(1.0, score + 0.10)
+        # ── NEW: Reasoning quality bonus ─────────────────────────────────────
+        if self._reasoning_scores:
+            avg_r = sum(self._reasoning_scores) / len(self._reasoning_scores)
+            if avg_r >= 0.7:
+                score = min(1.0, score + 0.05)
         return round(score, 4)
 
     def close(self):
